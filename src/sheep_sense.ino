@@ -88,7 +88,7 @@ void setup() {
 
     bool newFile = !SD.exists("/log.csv");
 
-    logFile = SD.open "# SheepSense" >> README.md("/log.csv", FILE_APPEND);
+    logFile = SD.open ("/log.csv", FILE_APPEND);
 
     if (logFile) {
       if (newFile || logFile.size() == 0) {
