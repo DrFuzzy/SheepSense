@@ -1,247 +1,439 @@
+#include <Arduino.h>
 #include <Wire.h>
 #include <SPI.h>
 #include <SD.h>
 #include <RTClib.h>
-#include <ICM_20948.h>   // SparkFun ICM-20948 library
+#include <ICM_20948.h>
 
-// SD card SPI pins
-#define SD_CS    D3
-#define SD_SCK   D2
-#define SD_MISO  D1
-#define SD_MOSI  D0
+// -----------------------------------------------------------------------------
+// Pin configuration
+// -----------------------------------------------------------------------------
 
-// I2C pins
-#define I2C_SDA  D4
-#define I2C_SCL  D5
+// Adafruit microSD SPI breakout:
+//
+// SI  -> XIAO D0 / MOSI
+// SO  -> XIAO D1 / MISO
+// CLK -> XIAO D2 / SCK
+// CS  -> XIAO D3
 
-// ICM-20948 I2C address selector.
-// For many SparkFun boards the default is AD0 = 1.
-// If your IMU is not detected, change this to 0.
-#define AD0_VAL  1
+constexpr uint8_t SD_MOSI = D0;
+constexpr uint8_t SD_MISO = D1;
+constexpr uint8_t SD_SCK  = D2;
+constexpr uint8_t SD_CS   = D3;
 
-RTC_DS1307 rtc;
+// I2C:
+//
+// SDA -> XIAO D4
+// SCL -> XIAO D5
+
+constexpr uint8_t I2C_SDA = D4;
+constexpr uint8_t I2C_SCL = D5;
+
+// The ADDR+1 trace was cut, so the ICM-20948 uses address 0x69.
+constexpr bool IMU_AD0_VALUE = true;
+
+// -----------------------------------------------------------------------------
+// Configuration
+// -----------------------------------------------------------------------------
+
+constexpr uint32_t SERIAL_BAUD = 115200;
+constexpr uint32_t I2C_FREQUENCY_HZ = 400000;
+constexpr uint32_t SAMPLE_INTERVAL_MS = 1000;
+
+constexpr char LOG_FILE_PATH[] = "/log.csv";
+
+// -----------------------------------------------------------------------------
+// Hardware objects
+// -----------------------------------------------------------------------------
+
+RTC_DS3231 rtc;
 ICM_20948_I2C imu;
+File log_file;
 
-File logFile;
+// -----------------------------------------------------------------------------
+// Hardware state
+// -----------------------------------------------------------------------------
 
-bool rtcOK = false;
-bool sdOK = false;
-bool imuOK = false;
+bool rtc_ok = false;
+bool imu_ok = false;
+bool sd_ok = false;
 
-void print2digits(File &file, int value) {
-  if (value < 10) file.print("0");
-  file.print(value);
-}
+// -----------------------------------------------------------------------------
+// Function declarations
+// -----------------------------------------------------------------------------
 
-void print2digitsSerial(int value) {
-  if (value < 10) Serial.print("0");
-  Serial.print(value);
-}
+void print_two_digits(
+    File &file,
+    int value);
+
+void print_two_digits_serial(int value);
+
+// -----------------------------------------------------------------------------
+// Setup
+// -----------------------------------------------------------------------------
 
 void setup() {
-  Serial.begin(115200);
+  Serial.begin(SERIAL_BAUD);
   delay(1000);
 
   Serial.println();
-  Serial.println("XIAO ESP32-C3 SD + RTC + ICM-20948 logger");
+  Serial.println(
+      "XIAO ESP32-C3 SD + DS3231 + ICM-20948 logger");
 
+  // ---------------------------------------------------------------------------
   // I2C
-  Wire.begin(I2C_SDA, I2C_SCL);
-  Wire.setClock(400000);
+  // ---------------------------------------------------------------------------
 
-  // RTC
-  rtcOK = rtc.begin();
-
-  if (!rtcOK) {
-    Serial.println("RTC not found!");
-  } else {
-    Serial.println("RTC OK");
-
-    if (!rtc.isrunning()) {
-      Serial.println("RTC is not running. Setting RTC to compile time.");
-      rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
-    }
+  if (!Wire.begin(I2C_SDA, I2C_SCL)) {
+    Serial.println("I2C initialisation failed");
   }
 
-  // ICM-20948
-  imu.begin(Wire, AD0_VAL);
+  Wire.setClock(I2C_FREQUENCY_HZ);
+  Wire.setTimeOut(100);
 
-  Serial.print("ICM-20948 initialisation returned: ");
+  // ---------------------------------------------------------------------------
+  // DS3231 RTC
+  // ---------------------------------------------------------------------------
+
+  rtc_ok = rtc.begin();
+
+  if (!rtc_ok) {
+    Serial.println("DS3231 RTC not found!");
+  } else {
+    Serial.println("DS3231 RTC OK");
+
+    if (rtc.lostPower()) {
+      Serial.println(
+          "RTC lost power. Setting RTC to compile time.");
+
+      rtc.adjust(
+          DateTime(F(__DATE__), F(__TIME__)));
+    }
+
+    const DateTime current_time = rtc.now();
+
+    Serial.print("RTC time: ");
+    Serial.println(current_time.timestamp());
+  }
+
+  // ---------------------------------------------------------------------------
+  // ICM-20948
+  // ---------------------------------------------------------------------------
+
+  imu.begin(Wire, IMU_AD0_VALUE);
+
+  Serial.print(
+      "ICM-20948 initialisation returned: ");
+
   Serial.println(imu.statusString());
 
   if (imu.status == ICM_20948_Stat_Ok) {
-    imuOK = true;
+    imu_ok = true;
+
     Serial.println("ICM-20948 OK");
+
+    const uint8_t who_am_i = imu.getWhoAmI();
+
+    Serial.printf(
+        "ICM-20948 WHO_AM_I: 0x%02X\n",
+        static_cast<unsigned int>(who_am_i));
   } else {
-    Serial.println("ICM-20948 not detected. Check wiring or try AD0_VAL = 0.");
+    Serial.println(
+        "ICM-20948 not detected. "
+        "Check the wiring and address setting.");
   }
 
+  // ---------------------------------------------------------------------------
   // SD card
-  SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+  // ---------------------------------------------------------------------------
 
-  sdOK = SD.begin(SD_CS, SPI);
+  pinMode(SD_CS, OUTPUT);
+  digitalWrite(SD_CS, HIGH);
 
-  if (!sdOK) {
-    Serial.println("SD card init failed!");
+  SPI.begin(
+      SD_SCK,
+      SD_MISO,
+      SD_MOSI,
+      SD_CS);
+
+  sd_ok = SD.begin(
+      SD_CS,
+      SPI);
+
+  if (!sd_ok) {
+    Serial.println("SD card initialisation failed!");
   } else {
     Serial.println("SD card OK");
 
-    bool newFile = !SD.exists("/log.csv");
+    const bool new_file =
+        !SD.exists(LOG_FILE_PATH);
 
-    logFile = SD.open ("/log.csv", FILE_APPEND);
+    log_file = SD.open(
+        LOG_FILE_PATH,
+        FILE_APPEND);
 
-    if (logFile) {
-      if (newFile || logFile.size() == 0) {
-        logFile.println("millis,date,time,ax_mg,ay_mg,az_mg,gx_dps,gy_dps,gz_dps,mx_uT,my_uT,mz_uT,temp_C");
+    if (log_file) {
+      if (new_file || log_file.size() == 0) {
+        log_file.println(
+            "elapsed_ms,"
+            "date,"
+            "time,"
+            "accel_x_mg,"
+            "accel_y_mg,"
+            "accel_z_mg,"
+            "gyro_x_dps,"
+            "gyro_y_dps,"
+            "gyro_z_dps,"
+            "mag_x_uT,"
+            "mag_y_uT,"
+            "mag_z_uT,"
+            "temperature_C");
+
+        log_file.flush();
       }
 
-      logFile.close();
+      log_file.close();
+
       Serial.println("log.csv ready");
     } else {
-      Serial.println("Could not create/open log.csv");
+      Serial.println(
+          "Could not create or open log.csv");
     }
   }
 }
 
-void loop() {
-  DateTime now;
+// -----------------------------------------------------------------------------
+// Main loop
+// -----------------------------------------------------------------------------
 
-  if (rtcOK) {
-    now = rtc.now();
+void loop() {
+  DateTime current_time;
+
+  if (rtc_ok) {
+    current_time = rtc.now();
   }
 
-  float ax = NAN;
-  float ay = NAN;
-  float az = NAN;
+  float accel_x = NAN;
+  float accel_y = NAN;
+  float accel_z = NAN;
 
-  float gx = NAN;
-  float gy = NAN;
-  float gz = NAN;
+  float gyro_x = NAN;
+  float gyro_y = NAN;
+  float gyro_z = NAN;
 
-  float mx = NAN;
-  float my = NAN;
-  float mz = NAN;
+  float mag_x = NAN;
+  float mag_y = NAN;
+  float mag_z = NAN;
 
-  float temp = NAN;
+  float temperature = NAN;
 
-  if (imuOK) {
-    if (imu.dataReady()) {
-      imu.getAGMT();
+  // ---------------------------------------------------------------------------
+  // Read ICM-20948
+  // ---------------------------------------------------------------------------
 
-      ax = imu.accX();   // mg
-      ay = imu.accY();   // mg
-      az = imu.accZ();   // mg
+  if (imu_ok) {
+    /*
+     * Read the latest sensor registers directly.
+     *
+     * This is more reliable with your module than depending on
+     * imu.dataReady().
+     */
+    imu.getAGMT();
 
-      gx = imu.gyrX();   // degrees per second
-      gy = imu.gyrY();   // degrees per second
-      gz = imu.gyrZ();   // degrees per second
+    if (imu.status == ICM_20948_Stat_Ok) {
+      accel_x = imu.accX();
+      accel_y = imu.accY();
+      accel_z = imu.accZ();
 
-      mx = imu.magX();   // microtesla
-      my = imu.magY();   // microtesla
-      mz = imu.magZ();   // microtesla
+      gyro_x = imu.gyrX();
+      gyro_y = imu.gyrY();
+      gyro_z = imu.gyrZ();
 
-      temp = imu.temp(); // Celsius
+      mag_x = imu.magX();
+      mag_y = imu.magY();
+      mag_z = imu.magZ();
+
+      temperature = imu.temp();
     } else {
-      Serial.println("ICM-20948 data not ready");
+      Serial.print("ICM-20948 read failed: ");
+      Serial.println(imu.statusString());
     }
   }
 
+  // ---------------------------------------------------------------------------
   // Serial output
-  if (rtcOK) {
-    Serial.print(now.year());
+  // ---------------------------------------------------------------------------
+
+  if (rtc_ok) {
+    Serial.print(current_time.year());
     Serial.print("-");
-    print2digitsSerial(now.month());
+
+    print_two_digits_serial(
+        current_time.month());
+
     Serial.print("-");
-    print2digitsSerial(now.day());
+
+    print_two_digits_serial(
+        current_time.day());
+
     Serial.print(" ");
 
-    print2digitsSerial(now.hour());
+    print_two_digits_serial(
+        current_time.hour());
+
     Serial.print(":");
-    print2digitsSerial(now.minute());
+
+    print_two_digits_serial(
+        current_time.minute());
+
     Serial.print(":");
-    print2digitsSerial(now.second());
+
+    print_two_digits_serial(
+        current_time.second());
   } else {
     Serial.print("RTC unavailable");
   }
 
-  Serial.print(" | Accel mg: ");
-  Serial.print(ax);
-  Serial.print(", ");
-  Serial.print(ay);
-  Serial.print(", ");
-  Serial.print(az);
+  Serial.print(" | Accel [mg] X: ");
+  Serial.print(accel_x);
 
-  Serial.print(" | Gyro dps: ");
-  Serial.print(gx);
-  Serial.print(", ");
-  Serial.print(gy);
-  Serial.print(", ");
-  Serial.print(gz);
+  Serial.print(" Y: ");
+  Serial.print(accel_y);
 
-  Serial.print(" | Mag uT: ");
-  Serial.print(mx);
-  Serial.print(", ");
-  Serial.print(my);
-  Serial.print(", ");
-  Serial.print(mz);
+  Serial.print(" Z: ");
+  Serial.print(accel_z);
 
-  Serial.print(" | Temp C: ");
-  Serial.println(temp);
+  Serial.print(" | Gyro [dps] X: ");
+  Serial.print(gyro_x);
 
+  Serial.print(" Y: ");
+  Serial.print(gyro_y);
+
+  Serial.print(" Z: ");
+  Serial.print(gyro_z);
+
+  Serial.print(" | Mag [uT] X: ");
+  Serial.print(mag_x);
+
+  Serial.print(" Y: ");
+  Serial.print(mag_y);
+
+  Serial.print(" Z: ");
+  Serial.print(mag_z);
+
+  Serial.print(" | Temperature [C]: ");
+  Serial.println(temperature);
+
+  // ---------------------------------------------------------------------------
   // CSV logging
-  if (sdOK) {
-    logFile = SD.open("/log.csv", FILE_APPEND);
+  // ---------------------------------------------------------------------------
 
-    if (logFile) {
-      logFile.print(millis());
-      logFile.print(",");
+  if (sd_ok) {
+    log_file = SD.open(
+        LOG_FILE_PATH,
+        FILE_APPEND);
 
-      if (rtcOK) {
-        logFile.print(now.year());
-        logFile.print("-");
-        print2digits(logFile, now.month());
-        logFile.print("-");
-        print2digits(logFile, now.day());
-        logFile.print(",");
+    if (log_file) {
+      log_file.print(millis());
+      log_file.print(",");
 
-        print2digits(logFile, now.hour());
-        logFile.print(":");
-        print2digits(logFile, now.minute());
-        logFile.print(":");
-        print2digits(logFile, now.second());
-        logFile.print(",");
+      if (rtc_ok) {
+        log_file.print(
+            current_time.year());
+
+        log_file.print("-");
+
+        print_two_digits(
+            log_file,
+            current_time.month());
+
+        log_file.print("-");
+
+        print_two_digits(
+            log_file,
+            current_time.day());
+
+        log_file.print(",");
+
+        print_two_digits(
+            log_file,
+            current_time.hour());
+
+        log_file.print(":");
+
+        print_two_digits(
+            log_file,
+            current_time.minute());
+
+        log_file.print(":");
+
+        print_two_digits(
+            log_file,
+            current_time.second());
+
+        log_file.print(",");
       } else {
-        logFile.print("NA,NA,");
+        log_file.print("NA,NA,");
       }
 
-      logFile.print(ax);
-      logFile.print(",");
-      logFile.print(ay);
-      logFile.print(",");
-      logFile.print(az);
-      logFile.print(",");
+      log_file.print(accel_x);
+      log_file.print(",");
 
-      logFile.print(gx);
-      logFile.print(",");
-      logFile.print(gy);
-      logFile.print(",");
-      logFile.print(gz);
-      logFile.print(",");
+      log_file.print(accel_y);
+      log_file.print(",");
 
-      logFile.print(mx);
-      logFile.print(",");
-      logFile.print(my);
-      logFile.print(",");
-      logFile.print(mz);
-      logFile.print(",");
+      log_file.print(accel_z);
+      log_file.print(",");
 
-      logFile.println(temp);
+      log_file.print(gyro_x);
+      log_file.print(",");
 
-      logFile.close();
+      log_file.print(gyro_y);
+      log_file.print(",");
+
+      log_file.print(gyro_z);
+      log_file.print(",");
+
+      log_file.print(mag_x);
+      log_file.print(",");
+
+      log_file.print(mag_y);
+      log_file.print(",");
+
+      log_file.print(mag_z);
+      log_file.print(",");
+
+      log_file.println(temperature);
+
+      log_file.close();
     } else {
-      Serial.println("Could not open log.csv");
+      Serial.println(
+          "Could not open log.csv");
     }
   }
 
-  delay(1000);
+  delay(SAMPLE_INTERVAL_MS);
+}
+
+// -----------------------------------------------------------------------------
+// Helper functions
+// -----------------------------------------------------------------------------
+
+void print_two_digits(
+    File &file,
+    int value) {
+
+  if (value < 10) {
+    file.print("0");
+  }
+
+  file.print(value);
+}
+
+void print_two_digits_serial(int value) {
+  if (value < 10) {
+    Serial.print("0");
+  }
+
+  Serial.print(value);
 }
