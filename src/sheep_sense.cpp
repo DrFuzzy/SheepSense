@@ -5,7 +5,6 @@
 #include <RTClib.h>
 #include <ICM_20948.h>
 #include <esp_timer.h>
-
 #include <cstdio>
 #include <cstring>
 
@@ -31,7 +30,7 @@ constexpr uint32_t IMU_MONITOR_INTERVAL_MS =
 // -----------------------------------------------------------------------------
 
 // Enable DS3231 RTC module.
-constexpr bool ENABLE_RTC = false;
+constexpr bool ENABLE_RTC = true;
 
 // Enable writing measurements to the microSD card.
 constexpr bool ENABLE_SD = true;
@@ -70,6 +69,39 @@ constexpr uint32_t I2C_FREQUENCY_HZ = 400000;
 constexpr bool IMU_AD0_VALUE = true;
 
 // -----------------------------------------------------------------------------
+// Button control configuration
+// -----------------------------------------------------------------------------
+
+// One control button is used to avoid ambiguous two-button sequences.
+constexpr uint8_t CONTROL_BUTTON_PIN = D9; // GPIO 9 (BOOT)
+constexpr bool CONTROL_BUTTON_ACTIVE_LOW = true;
+
+constexpr uint32_t BUTTON_DEBOUNCE_MS = 40;
+constexpr uint32_t BUTTON_SEQUENCE_TIMEOUT_MS = 700;
+
+constexpr uint8_t START_CLICK_COUNT = 1;
+constexpr uint8_t PAUSE_CLICK_COUNT = 2;
+constexpr uint8_t STOP_CLICK_COUNT  = 3;
+
+// -----------------------------------------------------------------------------
+// Status LED configuration
+// -----------------------------------------------------------------------------
+
+// Optional external status LED.
+//
+// The XIAO ESP32-C3 does not have a user-controllable onboard LED.
+// Set ENABLE_STATUS_LED to true only if you wire an external LED through
+// a suitable resistor, for example to D10.
+
+constexpr bool ENABLE_STATUS_LED = false;
+constexpr uint8_t STATUS_LED_PIN = D10;
+constexpr bool STATUS_LED_ACTIVE_LOW = false;
+
+constexpr uint32_t LED_IDLE_BLINK_INTERVAL_MS = 1000;
+constexpr uint32_t LED_PAUSED_BLINK_INTERVAL_MS = 250;
+constexpr uint32_t LED_STOPPED_BLINK_INTERVAL_MS = 2000;
+
+// -----------------------------------------------------------------------------
 // Logger configuration
 // -----------------------------------------------------------------------------
 
@@ -94,6 +126,19 @@ constexpr size_t LOG_BUFFER_SIZE = 16384;
 
 char log_buffer[LOG_BUFFER_SIZE];
 size_t log_buffer_used = 0;
+
+// -----------------------------------------------------------------------------
+// Logger run state
+// -----------------------------------------------------------------------------
+
+enum class LoggerState {
+  IDLE,
+  LOGGING,
+  PAUSED,
+  STOPPED
+};
+
+LoggerState logger_state = LoggerState::IDLE;
 
 // -----------------------------------------------------------------------------
 // Hardware objects
@@ -123,6 +168,25 @@ uint32_t last_rtc_refresh_ms = 0;
 uint32_t last_sd_flush_ms    = 0;
 uint32_t last_status_ms     = 0;
 uint32_t last_imu_print_ms   = 0;
+
+// -----------------------------------------------------------------------------
+// Button state
+// -----------------------------------------------------------------------------
+
+bool last_raw_button_pressed = false;
+bool debounced_button_pressed = false;
+
+uint32_t last_button_change_ms = 0;
+uint32_t last_button_release_ms = 0;
+
+uint8_t pending_button_clicks = 0;
+
+// -----------------------------------------------------------------------------
+// Status LED state
+// -----------------------------------------------------------------------------
+
+bool status_led_on = false;
+uint32_t last_status_led_toggle_ms = 0;
 
 // -----------------------------------------------------------------------------
 // Counters
@@ -172,6 +236,17 @@ void refresh_rtc(uint32_t now_ms);
 void service_periodic_tasks(uint32_t now_ms);
 void process_status_interval(uint32_t now_ms);
 
+void service_control_button(uint32_t now_ms);
+void process_button_sequence(uint8_t click_count);
+void start_logger();
+void pause_logger();
+void stop_logger();
+const char *logger_state_text();
+
+void initialise_status_led();
+void set_status_led(bool on);
+void service_status_led(uint32_t now_ms);
+
 // -----------------------------------------------------------------------------
 // Setup
 // -----------------------------------------------------------------------------
@@ -213,6 +288,23 @@ void setup() {
       static_cast<int>(SD_SCK),
       static_cast<int>(SD_CS));
 
+  pinMode(CONTROL_BUTTON_PIN, INPUT_PULLUP);
+  initialise_status_led();
+
+  Serial.printf(
+      "Control button: D6/GPIO%d, press sequence: "
+      "1=start/resume, 2=pause, 3=stop\n",
+      static_cast<int>(CONTROL_BUTTON_PIN));
+
+  if (ENABLE_STATUS_LED) {
+    Serial.printf(
+        "Status LED enabled on GPIO%d\n",
+        static_cast<int>(STATUS_LED_PIN));
+  } else {
+    Serial.println(
+        "Status LED disabled: LED_BUILTIN is not defined");
+  }
+
   // ---------------------------------------------------------------------------
   // I2C
   // ---------------------------------------------------------------------------
@@ -253,7 +345,8 @@ void setup() {
       esp_timer_get_time() + SAMPLE_PERIOD_US;
 
   Serial.println();
-  Serial.println("Logger started");
+  Serial.println("Logger ready");
+  Serial.println("Press the control button once to start logging");
 }
 
 // -----------------------------------------------------------------------------
@@ -264,7 +357,12 @@ void loop() {
   const int64_t now_us = esp_timer_get_time();
   const uint32_t now_ms = millis();
 
-  if (now_us >= next_sample_us) {
+  service_control_button(now_ms);
+  service_status_led(now_ms);
+
+  if (logger_state == LoggerState::LOGGING &&
+      now_us >= next_sample_us) {
+
     const int64_t lateness_us =
         now_us - next_sample_us;
 
@@ -286,6 +384,226 @@ void loop() {
   }
 
   service_periodic_tasks(now_ms);
+}
+
+
+// -----------------------------------------------------------------------------
+// Status LED
+// -----------------------------------------------------------------------------
+
+void initialise_status_led() {
+  if (!ENABLE_STATUS_LED) {
+    return;
+  }
+
+  pinMode(STATUS_LED_PIN, OUTPUT);
+  set_status_led(false);
+}
+
+void set_status_led(bool on) {
+  if (!ENABLE_STATUS_LED) {
+    return;
+  }
+
+  status_led_on = on;
+
+  const uint8_t output_level =
+      STATUS_LED_ACTIVE_LOW
+          ? (on ? LOW : HIGH)
+          : (on ? HIGH : LOW);
+
+  digitalWrite(STATUS_LED_PIN, output_level);
+}
+
+void service_status_led(uint32_t now_ms) {
+  if (!ENABLE_STATUS_LED) {
+    return;
+  }
+
+  switch (logger_state) {
+    case LoggerState::IDLE:
+      if ((now_ms - last_status_led_toggle_ms) >=
+          LED_IDLE_BLINK_INTERVAL_MS) {
+
+        set_status_led(!status_led_on);
+        last_status_led_toggle_ms = now_ms;
+      }
+      break;
+
+    case LoggerState::LOGGING:
+      set_status_led(true);
+      last_status_led_toggle_ms = now_ms;
+      break;
+
+    case LoggerState::PAUSED:
+      if ((now_ms - last_status_led_toggle_ms) >=
+          LED_PAUSED_BLINK_INTERVAL_MS) {
+
+        set_status_led(!status_led_on);
+        last_status_led_toggle_ms = now_ms;
+      }
+      break;
+
+    case LoggerState::STOPPED:
+      if ((now_ms - last_status_led_toggle_ms) >=
+          LED_STOPPED_BLINK_INTERVAL_MS) {
+
+        set_status_led(!status_led_on);
+        last_status_led_toggle_ms = now_ms;
+      }
+      break;
+  }
+}
+
+
+// -----------------------------------------------------------------------------
+// Button control
+// -----------------------------------------------------------------------------
+
+void service_control_button(uint32_t now_ms) {
+  const bool raw_button_pressed =
+      CONTROL_BUTTON_ACTIVE_LOW
+          ? digitalRead(CONTROL_BUTTON_PIN) == LOW
+          : digitalRead(CONTROL_BUTTON_PIN) == HIGH;
+
+  if (raw_button_pressed != last_raw_button_pressed) {
+    last_raw_button_pressed = raw_button_pressed;
+    last_button_change_ms = now_ms;
+  }
+
+  if ((now_ms - last_button_change_ms) <
+      BUTTON_DEBOUNCE_MS) {
+
+    return;
+  }
+
+  if (raw_button_pressed != debounced_button_pressed) {
+    debounced_button_pressed = raw_button_pressed;
+
+    if (!debounced_button_pressed) {
+      ++pending_button_clicks;
+      last_button_release_ms = now_ms;
+    }
+  }
+
+  if (pending_button_clicks > 0 &&
+      (now_ms - last_button_release_ms) >=
+          BUTTON_SEQUENCE_TIMEOUT_MS) {
+
+    const uint8_t click_count = pending_button_clicks;
+    pending_button_clicks = 0;
+
+    process_button_sequence(click_count);
+  }
+}
+
+void process_button_sequence(uint8_t click_count) {
+  if (click_count == START_CLICK_COUNT) {
+    start_logger();
+    return;
+  }
+
+  if (click_count == PAUSE_CLICK_COUNT) {
+    pause_logger();
+    return;
+  }
+
+  if (click_count >= STOP_CLICK_COUNT) {
+    stop_logger();
+    return;
+  }
+}
+
+void start_logger() {
+  if (logger_state == LoggerState::STOPPED) {
+    Serial.println(
+        "Logger already stopped; press reset to start a new run");
+    return;
+  }
+
+  if (!imu_ok) {
+    Serial.println("Cannot start: IMU is not ready");
+    return;
+  }
+
+  if (ENABLE_SD && !sd_ok) {
+    Serial.println("Cannot start: SD card is not ready");
+    return;
+  }
+
+  next_sample_us =
+      esp_timer_get_time() + SAMPLE_PERIOD_US;
+
+  last_status_ms = millis();
+  last_imu_print_ms = millis();
+
+  samples_acquired = 0;
+  samples_logged = 0;
+  imu_not_ready = 0;
+  imu_read_errors = 0;
+  scheduler_misses = 0;
+  sd_write_errors = 0;
+
+  logger_state = LoggerState::LOGGING;
+  last_status_led_toggle_ms = millis();
+  set_status_led(true);
+
+  Serial.println("Logger running");
+}
+
+void pause_logger() {
+  if (logger_state != LoggerState::LOGGING) {
+    Serial.println("Logger is not running");
+    return;
+  }
+
+  if (sd_ok) {
+    flush_log_buffer(true);
+  }
+
+  logger_state = LoggerState::PAUSED;
+  last_status_led_toggle_ms = millis();
+  set_status_led(false);
+
+  Serial.println("Logger paused");
+}
+
+void stop_logger() {
+  if (logger_state == LoggerState::STOPPED) {
+    Serial.println("Logger already stopped");
+    return;
+  }
+
+  if (sd_ok) {
+    flush_log_buffer(true);
+    log_file.close();
+  }
+
+  logger_state = LoggerState::STOPPED;
+  last_status_led_toggle_ms = millis();
+  set_status_led(false);
+
+  Serial.println("Logger stopped");
+  Serial.println("log.csv finalized; press reset to start a new run");
+}
+
+const char *logger_state_text() {
+  switch (logger_state) {
+    case LoggerState::IDLE:
+      return "IDLE";
+
+    case LoggerState::LOGGING:
+      return "LOGGING";
+
+    case LoggerState::PAUSED:
+      return "PAUSED";
+
+    case LoggerState::STOPPED:
+      return "STOPPED";
+
+    default:
+      return "UNKNOWN";
+  }
 }
 
 // -----------------------------------------------------------------------------
@@ -844,6 +1162,7 @@ void service_periodic_tasks(uint32_t now_ms) {
   refresh_rtc(now_ms);
 
   if (sd_ok &&
+      logger_state != LoggerState::STOPPED &&
       (now_ms - last_sd_flush_ms) >=
           SD_FLUSH_INTERVAL_MS) {
 
@@ -880,6 +1199,7 @@ void process_status_interval(uint32_t now_ms) {
 
   if (DEBUG_PRINT_LOGGER_STATUS) {
     Serial.printf(
+        "State: %s | "
         "Acquired: %.1f Hz | "
         "Logged: %.1f Hz | "
         "not ready: %lu | "
@@ -889,6 +1209,7 @@ void process_status_interval(uint32_t now_ms) {
         "IMU: %s | "
         "SD: %s | "
         "RTC: %s\n",
+        logger_state_text(),
         acquired_rate,
         logged_rate,
         static_cast<unsigned long>(
