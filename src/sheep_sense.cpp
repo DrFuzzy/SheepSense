@@ -1,4 +1,3 @@
-#include <Arduino.h>
 #include <Wire.h>
 #include <SPI.h>
 #include <SD.h>
@@ -7,6 +6,7 @@
 #include <esp_timer.h>
 #include <cstdio>
 #include <cstring>
+#include <Arduino.h>
 
 // -----------------------------------------------------------------------------
 // Debug configuration
@@ -77,11 +77,20 @@ constexpr uint8_t CONTROL_BUTTON_PIN = D9; // GPIO 9 (BOOT)
 constexpr bool CONTROL_BUTTON_ACTIVE_LOW = true;
 
 constexpr uint32_t BUTTON_DEBOUNCE_MS = 40;
-constexpr uint32_t BUTTON_SEQUENCE_TIMEOUT_MS = 700;
+constexpr uint32_t BUTTON_SEQUENCE_TIMEOUT_MS = 1200;
 
 constexpr uint8_t START_CLICK_COUNT = 1;
 constexpr uint8_t PAUSE_CLICK_COUNT = 2;
 constexpr uint8_t STOP_CLICK_COUNT  = 3;
+
+// Pin that receives the external sync pulse, used to align this log with other data sources.
+constexpr uint8_t SYNC_INTERRUPT_PIN = D7;
+// Set by the ISR when a sync pulse arrives; read and cleared once per sample.
+volatile uint8_t sync_bit = 0;
+// ISR for the sync pulse input; keep this minimal since it runs from IRAM.
+void IRAM_ATTR handle_sync_pulse() {
+  sync_bit = 1;
+}
 
 // -----------------------------------------------------------------------------
 // Status LED configuration
@@ -291,6 +300,13 @@ void setup() {
   pinMode(CONTROL_BUTTON_PIN, INPUT_PULLUP);
   initialise_status_led();
 
+  // Sync pulse is idle low and rises when a pulse arrives.
+  pinMode(SYNC_INTERRUPT_PIN, INPUT_PULLDOWN);
+  attachInterrupt(
+      digitalPinToInterrupt(SYNC_INTERRUPT_PIN),
+      handle_sync_pulse,
+      RISING);
+
   Serial.printf(
       "Control button: D6/GPIO%d, press sequence: "
       "1=start/resume, 2=pause, 3=stop\n",
@@ -386,7 +402,6 @@ void loop() {
   service_periodic_tasks(now_ms);
 }
 
-
 // -----------------------------------------------------------------------------
 // Status LED
 // -----------------------------------------------------------------------------
@@ -454,7 +469,6 @@ void service_status_led(uint32_t now_ms) {
       break;
   }
 }
-
 
 // -----------------------------------------------------------------------------
 // Button control
@@ -808,7 +822,8 @@ bool initialise_sd() {
       "mag_x_uT,"
       "mag_y_uT,"
       "mag_z_uT,"
-      "temperature_C\n";
+      "temperature_C,"
+      "sync_pulse\n";
 
   constexpr size_t HEADER_LENGTH =
       sizeof(CSV_HEADER) - 1;
@@ -863,6 +878,12 @@ void acquire_and_log_sample(int64_t sample_time_us) {
     ++imu_not_ready;
     return;
   }
+
+  // Snapshot the ISR-set flag before clearing it, since a new pulse could
+  // arrive and overwrite it while this sample is being processed.
+  const uint8_t current_sync_bit = sync_bit;
+  // Reset for the next sample now that this one has captured the pulse.
+  sync_bit = 0;
 
   imu.getAGMT();
 
@@ -970,7 +991,9 @@ void acquire_and_log_sample(int64_t sample_time_us) {
         "NA");
   }
 
-  char line[280];
+  // Sized for sample_index/elapsed_ms, date/time text, the nine IMU
+  // fields, temperature, and the added sync_pulse column.
+  char line[310];
 
   const int line_length = snprintf(
       line,
@@ -988,7 +1011,9 @@ void acquire_and_log_sample(int64_t sample_time_us) {
       "%.3f,"
       "%.3f,"
       "%.3f,"
-      "%.3f\n",
+      "%.3f,"
+      // sync_pulse: 1 if the external sync line pulsed during this sample.
+      "%u\n",
       static_cast<unsigned long long>(
           sample_index),
       static_cast<unsigned long long>(
@@ -1004,7 +1029,8 @@ void acquire_and_log_sample(int64_t sample_time_us) {
       mx,
       my,
       mz,
-      temperature);
+      temperature,
+      current_sync_bit);
 
   if (line_length <= 0 ||
       static_cast<size_t>(line_length) >=
@@ -1236,3 +1262,4 @@ void process_status_interval(uint32_t now_ms) {
 
   last_status_ms = now_ms;
 }
+
